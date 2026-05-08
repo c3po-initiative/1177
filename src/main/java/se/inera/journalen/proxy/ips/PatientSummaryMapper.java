@@ -2,10 +2,15 @@ package se.inera.journalen.proxy.ips;
 
 import org.hl7.fhir.r4.model.AllergyIntolerance;
 import org.hl7.fhir.r4.model.Bundle;
+import org.hl7.fhir.r4.model.CarePlan;
 import org.hl7.fhir.r4.model.CodeableConcept;
 import org.hl7.fhir.r4.model.Coding;
 import org.hl7.fhir.r4.model.Composition;
 import org.hl7.fhir.r4.model.Condition;
+import org.hl7.fhir.r4.model.Consent;
+import org.hl7.fhir.r4.model.DiagnosticReport;
+import org.hl7.fhir.r4.model.DomainResource;
+import org.hl7.fhir.r4.model.Encounter;
 import org.hl7.fhir.r4.model.Identifier;
 import org.hl7.fhir.r4.model.Immunization;
 import org.hl7.fhir.r4.model.MedicationStatement;
@@ -13,6 +18,7 @@ import org.hl7.fhir.r4.model.Observation;
 import org.hl7.fhir.r4.model.Patient;
 import org.hl7.fhir.r4.model.Reference;
 import org.hl7.fhir.r4.model.Resource;
+import org.hl7.fhir.r4.model.ServiceRequest;
 
 import java.util.ArrayList;
 import java.util.Date;
@@ -49,7 +55,14 @@ public final class PatientSummaryMapper {
         for (MedicationStatement m : data.medications) { ensureId(m); applyProfile(m, IpsProfiles.MEDICATION); m.setSubject(patientRef); }
         for (AllergyIntolerance a : data.allergies)    { ensureId(a); applyProfile(a, IpsProfiles.ALLERGY); a.setPatient(patientRef); }
         for (Immunization i : data.immunizations)      { ensureId(i); applyProfile(i, IpsProfiles.IMMUNIZATION); i.setPatient(patientRef); }
-        for (Observation o : data.observations)        { ensureId(o); applyProfile(o, IpsProfiles.OBSERVATION_LAB); o.setSubject(patientRef); }
+        for (Observation o : data.labResults)          { ensureId(o); applyProfile(o, IpsProfiles.OBSERVATION_LAB); o.setSubject(patientRef); }
+        for (Observation o : data.vitalSigns)          { ensureId(o); applyProfile(o, IpsProfiles.OBSERVATION_VITAL_SIGNS); o.setSubject(patientRef); }
+        for (Observation o : data.functionalStatus)    { ensureId(o); o.setSubject(patientRef); }
+        for (CarePlan cp : data.carePlans)             { ensureId(cp); applyProfile(cp, IpsProfiles.CARE_PLAN); cp.setSubject(patientRef); }
+        for (ServiceRequest sr : data.serviceRequests) { ensureId(sr); applyProfile(sr, IpsProfiles.SERVICE_REQUEST); sr.setSubject(patientRef); }
+        for (Encounter e : data.encounters)            { ensureId(e); applyProfile(e, IpsProfiles.ENCOUNTER); e.setSubject(patientRef); }
+        for (DiagnosticReport r : data.diagnosticReports) { ensureId(r); applyProfile(r, IpsProfiles.DIAGNOSTIC_REPORT); r.setSubject(patientRef); }
+        for (Consent c : data.consents)                { ensureId(c); applyProfile(c, IpsProfiles.CONSENT); c.setPatient(patientRef); }
 
         Composition composition = buildComposition(data, patientRef);
         ensureId(composition);
@@ -57,12 +70,23 @@ public final class PatientSummaryMapper {
         // Composition is always the first entry of an IPS Document Bundle.
         bundle.addEntry(entry(composition));
         bundle.addEntry(entry(data.patient));
-        for (Condition c : data.conditions) bundle.addEntry(entry(c));
-        for (MedicationStatement m : data.medications) bundle.addEntry(entry(m));
-        for (AllergyIntolerance a : data.allergies) bundle.addEntry(entry(a));
-        for (Immunization i : data.immunizations) bundle.addEntry(entry(i));
-        for (Observation o : data.observations) bundle.addEntry(entry(o));
+        addAll(bundle, data.conditions);
+        addAll(bundle, data.medications);
+        addAll(bundle, data.allergies);
+        addAll(bundle, data.immunizations);
+        addAll(bundle, data.labResults);
+        addAll(bundle, data.vitalSigns);
+        addAll(bundle, data.functionalStatus);
+        addAll(bundle, data.carePlans);
+        addAll(bundle, data.serviceRequests);
+        addAll(bundle, data.encounters);
+        addAll(bundle, data.diagnosticReports);
+        addAll(bundle, data.consents);
         return bundle;
+    }
+
+    private static <R extends DomainResource> void addAll(Bundle b, List<R> resources) {
+        for (R r : resources) b.addEntry(entry(r));
     }
 
     private static Composition buildComposition(PatientSummaryData data, Reference patientRef) {
@@ -80,11 +104,31 @@ public final class PatientSummaryMapper {
         c.addAuthor(new Reference().setDisplay(AUTHOR_DISPLAY));
         c.setTitle("International Patient Summary");
 
+        // Required + recommended sections — always present, with no-known/emptyReason fallbacks.
         c.addSection(problemsSection(data.conditions, patientRef));
         c.addSection(medicationsSection(data.medications, patientRef));
         c.addSection(allergiesSection(data.allergies, patientRef));
         c.addSection(immunizationsSection(data.immunizations, patientRef));
-        c.addSection(resultsSection(data.observations, data.labsUnavailable));
+        c.addSection(resultsSection(data.labResults, data.diagnosticReports, data.labsUnavailable));
+
+        // Optional sections — only emit when there is data (or, for Vital Signs, when the
+        // upstream is unavailable so we can flag it explicitly). Keeps minimal-data IPS bundles
+        // small but surfaces all the proxy's coverage when the patient has it.
+        if (!data.vitalSigns.isEmpty() || data.vitalSignsUnavailable) {
+            c.addSection(vitalSignsSection(data.vitalSigns, data.vitalSignsUnavailable));
+        }
+        if (!data.functionalStatus.isEmpty()) {
+            c.addSection(functionalStatusSection(data.functionalStatus));
+        }
+        if (!data.carePlans.isEmpty() || !data.serviceRequests.isEmpty()) {
+            c.addSection(planOfCareSection(data.carePlans, data.serviceRequests));
+        }
+        if (!data.encounters.isEmpty()) {
+            c.addSection(pastHistorySection(data.encounters));
+        }
+        if (!data.consents.isEmpty()) {
+            c.addSection(advanceDirectivesSection(data.consents));
+        }
         return c;
     }
 
@@ -140,7 +184,9 @@ public final class PatientSummaryMapper {
         return s;
     }
 
-    private static Composition.SectionComponent resultsSection(List<Observation> obs, boolean unavailable) {
+    private static Composition.SectionComponent resultsSection(List<Observation> obs,
+                                                                List<DiagnosticReport> reports,
+                                                                boolean unavailable) {
         Composition.SectionComponent s = new Composition.SectionComponent()
                 .setTitle("Results")
                 .setCode(loinc(IpsProfiles.SECTION_RESULTS, "Relevant diagnostic tests/laboratory data Narrative"));
@@ -150,13 +196,61 @@ public final class PatientSummaryMapper {
                     .setCode("unavailable").setDisplay("Unavailable")));
             return s;
         }
-        if (obs.isEmpty()) {
+        if (obs.isEmpty() && reports.isEmpty()) {
             s.setEmptyReason(new CodeableConcept().addCoding(new Coding()
                     .setSystem(IpsProfiles.LIST_EMPTY_REASON)
                     .setCode("nilknown").setDisplay("Nil Known")));
         } else {
             for (Observation o : obs) s.addEntry(uuidRef(o));
+            for (DiagnosticReport r : reports) s.addEntry(uuidRef(r));
         }
+        return s;
+    }
+
+    private static Composition.SectionComponent vitalSignsSection(List<Observation> obs, boolean unavailable) {
+        Composition.SectionComponent s = new Composition.SectionComponent()
+                .setTitle("Vital Signs")
+                .setCode(loinc(IpsProfiles.SECTION_VITAL_SIGNS, "Vital signs"));
+        if (unavailable) {
+            s.setEmptyReason(new CodeableConcept().addCoding(new Coding()
+                    .setSystem(IpsProfiles.LIST_EMPTY_REASON)
+                    .setCode("unavailable").setDisplay("Unavailable")));
+        } else {
+            for (Observation o : obs) s.addEntry(uuidRef(o));
+        }
+        return s;
+    }
+
+    private static Composition.SectionComponent functionalStatusSection(List<Observation> obs) {
+        Composition.SectionComponent s = new Composition.SectionComponent()
+                .setTitle("Functional Status")
+                .setCode(loinc(IpsProfiles.SECTION_FUNCTIONAL_STATUS, "Functional status assessment note"));
+        for (Observation o : obs) s.addEntry(uuidRef(o));
+        return s;
+    }
+
+    private static Composition.SectionComponent planOfCareSection(List<CarePlan> plans, List<ServiceRequest> requests) {
+        Composition.SectionComponent s = new Composition.SectionComponent()
+                .setTitle("Plan of Care")
+                .setCode(loinc(IpsProfiles.SECTION_PLAN_OF_CARE, "Plan of treatment"));
+        for (CarePlan p : plans) s.addEntry(uuidRef(p));
+        for (ServiceRequest r : requests) s.addEntry(uuidRef(r));
+        return s;
+    }
+
+    private static Composition.SectionComponent pastHistorySection(List<Encounter> encounters) {
+        Composition.SectionComponent s = new Composition.SectionComponent()
+                .setTitle("Past History of Encounters")
+                .setCode(loinc(IpsProfiles.SECTION_PAST_HISTORY, "History of Past illness Narrative"));
+        for (Encounter e : encounters) s.addEntry(uuidRef(e));
+        return s;
+    }
+
+    private static Composition.SectionComponent advanceDirectivesSection(List<Consent> consents) {
+        Composition.SectionComponent s = new Composition.SectionComponent()
+                .setTitle("Advance Directives")
+                .setCode(loinc(IpsProfiles.SECTION_ADVANCE_DIRECTIVES, "Advance directives"));
+        for (Consent c : consents) s.addEntry(uuidRef(c));
         return s;
     }
 
