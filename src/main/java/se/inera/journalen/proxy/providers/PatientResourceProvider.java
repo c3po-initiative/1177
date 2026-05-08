@@ -7,10 +7,12 @@ import ca.uhn.fhir.rest.annotation.Search;
 import ca.uhn.fhir.rest.api.server.RequestDetails;
 import ca.uhn.fhir.rest.server.IResourceProvider;
 import org.hl7.fhir.r4.model.Bundle;
+import org.hl7.fhir.r4.model.Enumerations;
 import org.hl7.fhir.r4.model.Identifier;
 import org.hl7.fhir.r4.model.Patient;
 import org.hl7.fhir.r4.model.IdType;
 
+import java.time.LocalDate;
 import java.util.List;
 
 import se.inera.journalen.proxy.ips.PatientSummaryMapper;
@@ -64,7 +66,38 @@ public class PatientResourceProvider implements IResourceProvider {
         p.setId(idPart);
         if (pnr != null) {
             p.addIdentifier(new Identifier().setSystem(PNR_SYSTEM).setValue(pnr));
+            populateDemographicsFromPersonnummer(p, pnr);
         }
         return p;
+    }
+
+    /**
+     * Swedish personnummer encodes both birth date and gender:
+     * <ul>
+     *   <li>positions 1-8: {@code YYYYMMDD}</li>
+     *   <li>position 11 (3rd-from-right): odd digit = male, even = female</li>
+     * </ul>
+     * 10-digit short form ({@code YYMMDD-NNNC}) cannot disambiguate the century without the
+     * separator (+/-) so we only handle the full 12-digit form here.
+     */
+    static void populateDemographicsFromPersonnummer(Patient p, String pnr) {
+        if (pnr == null || pnr.length() != 12 || !pnr.chars().allMatch(Character::isDigit)) return;
+        try {
+            int year  = Integer.parseInt(pnr.substring(0, 4));
+            int month = Integer.parseInt(pnr.substring(4, 6));
+            int day   = Integer.parseInt(pnr.substring(6, 8));
+            // "Samordningsnummer" (coordination numbers) add 60 to the day; treat them as the
+            // intended birth date by subtracting 60. Day-of-month must be 1..31 either way.
+            int realDay = day > 60 ? day - 60 : day;
+            LocalDate birth = LocalDate.of(year, month, realDay);
+            p.setBirthDate(java.util.Date.from(birth.atStartOfDay(
+                    java.time.ZoneId.of("Europe/Stockholm")).toInstant()));
+            int genderDigit = Character.digit(pnr.charAt(10), 10);
+            p.setGender((genderDigit % 2 == 0)
+                    ? Enumerations.AdministrativeGender.FEMALE
+                    : Enumerations.AdministrativeGender.MALE);
+        } catch (Exception ignored) {
+            // Not a valid pnr; leave demographics unset.
+        }
     }
 }

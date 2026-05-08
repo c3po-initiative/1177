@@ -10,10 +10,12 @@ import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import se.inera.journalen.proxy.upstream.dto.AllergyDetail;
 import se.inera.journalen.proxy.upstream.dto.DiagnosisDetail;
 import se.inera.journalen.proxy.upstream.dto.JournalDetail;
 import se.inera.journalen.proxy.upstream.dto.ListRow;
 import se.inera.journalen.proxy.upstream.dto.MedicationDetail;
+import se.inera.journalen.proxy.upstream.dto.ServiceRequestDetail;
 
 /**
  * Pure HTML extraction. The portal renders each row as
@@ -201,6 +203,92 @@ public class PartialViewParser {
         return d;
     }
 
+    /** Referral / ServiceRequest detail parser. */
+    public ServiceRequestDetail parseServiceRequestDetail(String html) {
+        ServiceRequestDetail d = new ServiceRequestDetail();
+        populateGeneric(d, html);
+        if (d.html == null) return d;
+        Document doc = parseFragment(html);
+
+        // "Skickad av" row — sender. ownText() gives just the inline text node, the inner
+        // .nu-display-block (sub-unit) is the second line.
+        for (Element row : doc.select(".information-details__row")) {
+            Element titleEl = row.selectFirst(".detail-title");
+            Element descEl = row.selectFirst(".detail-description");
+            if (titleEl == null || descEl == null) continue;
+            if ("Skickad av".equals(titleEl.text().trim())) {
+                String top = descEl.ownText().trim();
+                Element block = descEl.selectFirst("span.nu-display-block");
+                String unit = block != null ? block.text().trim() : null;
+                if (!top.isEmpty() && unit != null && !unit.isEmpty()) {
+                    d.sender = top + " — " + unit;
+                } else if (unit != null && !unit.isEmpty()) {
+                    d.sender = unit;
+                } else if (!top.isEmpty()) {
+                    d.sender = top;
+                }
+                break;
+            }
+        }
+
+        // Status timeline: each <li class="nc-referral-status"> has a date + status text + by-unit.
+        for (Element li : doc.select("li.nc-referral-status")) {
+            Element dateEl = li.selectFirst(".nc-referral-status-date");
+            // The status block appears twice (mobile + desktop); taking the first is enough.
+            Element textEl = li.selectFirst(".nc-referral-status-text");
+            String date = dateEl != null ? dateEl.text().trim() : null;
+            String status = textEl != null ? textEl.text().trim() : null;
+            // The "by unit" line follows the status text inside the same grid cell. We select
+            // the desktop block (".iu-grid-span-6") and take its plain text minus the status text.
+            Element block = li.selectFirst(".iu-grid-span-6");
+            String by = null;
+            if (block != null) {
+                String txt = block.text().trim();
+                if (status != null && txt.startsWith(status)) {
+                    by = txt.substring(status.length()).trim();
+                } else {
+                    by = txt;
+                }
+            }
+            d.statusTimeline.add(new ServiceRequestDetail.StatusEntry(date, status, by));
+        }
+        return d;
+    }
+
+    /** Allergy detail parser — same shell + a few rows specific to attentionSignals. */
+    public AllergyDetail parseAllergyDetail(String html) {
+        AllergyDetail d = new AllergyDetail();
+        populateGeneric(d, html);
+        if (d.html == null) return d;
+        Document doc = parseFragment(html);
+        // The allergen is the row whose title equals the heading (both "Överkänslighet" or
+        // "Allergi"). We look for the first information-details__row whose title text matches
+        // the heading text — that's the row containing the actual allergen value.
+        String heading = d.title;
+        for (Element row : doc.select(".information-details__row")) {
+            Element titleEl = row.selectFirst(".detail-title");
+            Element descEl = row.selectFirst(".detail-description");
+            if (titleEl == null || descEl == null) continue;
+            org.jsoup.nodes.Element descCopy = descEl.clone();
+            descCopy.select(".iu-sr-only").remove();
+            String title = titleEl.text().trim();
+            String desc  = descCopy.text().trim();
+            if ("-".equals(desc) || "Saknas".equals(desc) || desc.isEmpty()) continue;
+
+            if (heading != null && title.equalsIgnoreCase(heading) && d.allergen == null) {
+                d.allergen = desc;
+            } else switch (title) {
+                case "Allvarlighetsgrad" -> d.severity = desc;
+                case "Visshetsgrad"      -> d.certainty = desc;
+                case "Giltighetstid"     -> d.validityRaw = desc;
+                case "Aktuell"           -> d.activeRaw = desc;
+                case "Signerad"          -> d.signedRaw = desc;
+                default -> {}
+            }
+        }
+        return d;
+    }
+
     private static String[] splitOnSlash(String s) {
         if (s == null) return null;
         int idx = s.indexOf(" / ");
@@ -230,22 +318,48 @@ public class PartialViewParser {
         Element ts = doc.selectFirst(".nc-document-timestamp");
         if (ts != null) d.timestamp = ts.text().trim();
 
+        // Asserter — "Antecknad av" on most categories; "Ansvarig för kontakten" on CareContact
+        // (Encounter) detailviews; "Skickad av" on referrals (sender). We match the first one
+        // that's present.
         for (Element row : doc.select(".information-details__row")) {
             Element title = row.selectFirst(".detail-title");
             Element desc  = row.selectFirst(".detail-description");
             if (title == null || desc == null) continue;
-            if ("Antecknad av".equals(title.text().trim())) {
-                Element block = desc.selectFirst("span.nu-display-block");
-                if (block != null) d.careUnit = block.text().trim();
-                String nameRole = desc.ownText().trim();
-                Matcher m = NAME_ROLE.matcher(nameRole);
-                if (m.matches()) {
-                    d.asserterName = m.group(1).trim();
-                    d.asserterRole = m.group(2).trim();
-                } else if (!nameRole.isEmpty()) {
-                    d.asserterName = nameRole;
+            String label = title.text().trim();
+            boolean isAsserterLabel =
+                    "Antecknad av".equals(label)
+                    || "Ansvarig för kontakten".equals(label);
+            if (!isAsserterLabel) continue;
+
+            Element block = desc.selectFirst("span.nu-display-block");
+            if (block != null) d.careUnit = block.text().trim();
+            String nameRole = desc.ownText().trim();
+            Matcher m = NAME_ROLE.matcher(nameRole);
+            if (m.matches()) {
+                d.asserterName = m.group(1).trim();
+                d.asserterRole = m.group(2).trim();
+            } else if (!nameRole.isEmpty()) {
+                d.asserterName = nameRole;
+            }
+            break;
+        }
+
+        // "Dag & tid" row (CareContact) — fall back here when there's no .nc-document-timestamp.
+        if (d.timestamp == null) {
+            for (Element row : doc.select(".information-details__row")) {
+                Element title = row.selectFirst(".detail-title");
+                Element desc  = row.selectFirst(".detail-description");
+                if (title == null || desc == null) continue;
+                String label = title.text().trim();
+                if ("Dag & tid:".equals(label) || "Dag & tid".equals(label)
+                        || "Dag och tid".equals(label) || "Dag och tid:".equals(label)) {
+                    String text = desc.text().trim();
+                    if (!text.isEmpty()) {
+                        // Store the raw Swedish prose; DateUtil knows how to parse it.
+                        d.timestamp = text;
+                    }
+                    break;
                 }
-                break;
             }
         }
     }

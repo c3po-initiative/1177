@@ -12,19 +12,20 @@ known to misbehave on** for the QA test users. The current resource map is in th
 
 | FHIR | Source | Live count | Depth |
 |---|---|---:|---|
-| `Condition` | `journalcategories/diagnosis` | 4 | Deep |
-| `MedicationStatement` | `journalcategories/medication` | 12 | Deep |
-| `DocumentReference?category=clinical-note` | `journalcategories/careDocumentation` | 11 | Read deep |
-| `DocumentReference` (timeline) | `journalcategories/journaloverview/polltimeline` | 50 | Skeleton |
-| `Encounter` | timeline rows where `data-cy-journal-overview-item-type="CareContact"` | ~21 / 50 | Skeleton |
-| `ServiceRequest` | `journalcategories/referralStatus` | 1 | Skeleton |
-| `AllergyIntolerance` | `journalcategories/attentionSignals` | 1 (Överkänslighet: Fisk) | Skeleton |
-| `AuditEvent` (default = patient self-access) | `LogsAndShare/JournalLog/PollUserAccessLogs` | 75+ | Skeleton |
-| `AuditEvent?agent=clinician` | `LogsAndShare/JournalLog/PollJournalLogs` | 0 | Skeleton |
+| `Patient/me` (demographics) | personnummer | 1 | **Deep** — birthDate + gender derived from the 12-digit form |
+| `Condition` | `journalcategories/diagnosis` | 4 | **Deep** |
+| `MedicationStatement` | `journalcategories/medication` | 12 | **Deep** |
+| `AllergyIntolerance` | `journalcategories/attentionSignals` | 1 (Överkänslighet: Fisk) | **Deep read** |
+| `ServiceRequest` | `journalcategories/referralStatus` | 1 | **Deep read** (status timeline as notes) |
+| `Encounter` | timeline rows where `data-cy-journal-overview-item-type="CareContact"` | ~21 / 50 | **Deep read** (period, participant, class, serviceProvider) |
+| `DocumentReference?category=clinical-note` | `journalcategories/careDocumentation` | 11 | **Deep read** |
+| `DocumentReference` (timeline) | `journalcategories/journaloverview/polltimeline` | 50 | Skeleton search, deep read |
+| `AuditEvent` (default = patient self-access) | `LogsAndShare/JournalLog/PollUserAccessLogs` | 75+ | **Deep search** (agent.who.identifier + self-access policy) |
+| `AuditEvent?agent=clinician` | `LogsAndShare/JournalLog/PollJournalLogs` | 0 | Skeleton (same mapper applies) |
 | `Consent` | `LogsAndShare/JournalBlock/Poll` | 0 | Skeleton |
-| `Appointment` | `bokadetider/api/appointments` | 1 | Deep |
-| `Communication` | `e-tjanster/api/core/inbox/message` | 381 | Deep (read inflates body) |
-| `Patient/me/$summary` | aggregated IPS Bundle | 1 (19 entries) | Deep |
+| `Appointment` | `bokadetider/api/appointments` | 1 | **Deep** |
+| `Communication` | `e-tjanster/api/core/inbox/message` | 381 | **Deep** (read inflates body) |
+| `Patient/me/$summary` | aggregated IPS Bundle | 1 (19+ entries) | **Deep** |
 | `CarePlan` | `journalcategories/careplan` | 0 | Skeleton |
 | `Immunization` | `journalcategories/vaccinationHistory` | 0 | Skeleton |
 | `Observation?category=survey` | `journalcategories/functionalStatus` | 0 | Skeleton |
@@ -93,49 +94,31 @@ something the proxy can recover from. The proxy surfaces these as 500 `Operation
 
 ## Skeleton resources that could be deepened
 
-### CareContact → `Encounter`
+(The previous list of skeletons has now been deepened in place — see the live-coverage
+table above. What remains in this section is the residual.)
 
-`Encounter` is currently skeleton. The shared `parseJournalDetail` already extracts type,
-timestamp, author and care unit (the same shell every detailview uses). What's missing:
+### `Patient/me.name`
 
-- read the "Dag & tid: onsdag 19 november 2025 klockan 14:43" row to set
-  `Encounter.period.start`,
-- map the visit-type Swedish string ("Mottagningsbesök", "Distanskontakt",
-  "Hembesök", …) to FHIR `Encounter.class` codes.
+The personnummer drives `birthDate` and `gender` cleanly, but the patient's *name* still
+isn't populated. `/Dashboard/GetLegalRepresentation` HTML carries it as the row marked
+`LegalRepresentationBadge` ("Visas"). One extra POST per `Patient` read would fill in
+`Patient.name[0].text`. Likely worth a small per-session cache so the read isn't quadratic.
 
-### `AllergyIntolerance` aria-label deep parse
+### `RelatedPerson` from the same legal-representation HTML
 
-The list-row's `aria-label` is structured: "Datum 2019-09-11, orsak Överkänslighet: Fisk,
-vårdenhet ..., Aktuell." Split into:
+The non-`LegalRepresentationBadge` rows in `Dashboard/GetLegalRepresentation` are the
+*delegated* journals (other patients who've shared their journal with this user) — a
+direct mapping to `RelatedPerson` with the patient as `RelatedPerson.patient` and the
+displayed name as `RelatedPerson.name`. We just need a non-empty test account to verify
+the row markup before wiring the deep parse.
 
-- `code.text` = allergen ("Fisk")
-- `reaction[0].manifestation[0].text` = reaction type ("Överkänslighet")
-- `clinicalStatus` = `active` for "Aktuell" / `resolved` for "Inaktuell"
-- `recordedDate` from "Datum"
+### `AuditEvent?agent=clinician`
 
-Plus the `attentionSignals/detailview` page would carry a richer DiagnosisDetail-like
-shell.
-
-### `Patient/me` demographics
-
-`Patient/me` currently exposes only the personnummer in `identifier`. The portal renders
-the patient's name (and sometimes birth date) on every page header. Scraping the
-homepage HTML once per session and caching `Patient.name[0]` and `Patient.birthDate`
-would make the resource useful to FHIR clients that don't already know who they're
-talking to.
-
-### `AuditEvent` agent typing
-
-Currently every audit row maps to a generic agent with `name=display`. The two endpoints
-imply two distinct agent shapes:
-
-- `PollUserAccessLogs` → patient self-access. Set
-  `agent.type` = `IRCP` (Information Recipient) +
-  `agent.who.reference = Patient/me`.
-- `PollJournalLogs` → clinician access. The `.AccessedBy` text usually carries the
-  clinician's name, role, and care unit — split into
-  `agent.who.display` + `agent.altId` + a separate
-  `agent[].requestor=true` for the care-unit organization.
+The default (self-access) endpoint is now deep. The clinician-access endpoint
+(`PollJournalLogs`) returns 0 for our test users so the row markup is unverified, but
+the same `.AccessedBy` parser should apply — the difference is just whose name is in the
+text. Confirm and split into `agent.who.display` + `agent.requestor=true` once we have
+data.
 
 ---
 

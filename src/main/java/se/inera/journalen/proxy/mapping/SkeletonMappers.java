@@ -224,14 +224,47 @@ public final class SkeletonMappers {
         e.setSubject(new Reference(patient));
         Date d = bestDate(row);
         if (d != null) {
-            // Single-instant period; the upstream UI shows date+time but no end.
             e.setPeriod(new Period().setStart(d));
         }
-        if (row.ariaLabel != null) {
+        // Pull a slightly cleaner type-text from the aria-label rather than the whole label.
+        // Format: "Datum 19 november 2025, Vårdkontakter, <type>, <care unit>, ..."
+        String type = encounterTypeFromAriaLabel(row.ariaLabel);
+        if (type != null) {
+            e.addType(new CodeableConcept().setText(type));
+        } else if (row.ariaLabel != null) {
             e.addType(new CodeableConcept().setText(row.ariaLabel));
         }
+        // Map the visit type to a v3 ActCode for Encounter.class.
+        Coding cls = encounterClassCode(type);
+        if (cls != null) e.setClass_(cls);
         applyNarrative(e, row);
         return e;
+    }
+
+    private static final java.util.regex.Pattern ENC_ARIA_TYPE = java.util.regex.Pattern.compile(
+            ", Vårdkontakter, ([^,]+),");
+
+    private static String encounterTypeFromAriaLabel(String aria) {
+        if (aria == null) return null;
+        java.util.regex.Matcher m = ENC_ARIA_TYPE.matcher(aria);
+        return m.find() ? m.group(1).trim() : null;
+    }
+
+    private static Coding encounterClassCode(String swedishType) {
+        if (swedishType == null) return null;
+        String t = swedishType.toLowerCase(java.util.Locale.ROOT);
+        // Mappings to v3-ActCode (http://terminology.hl7.org/CodeSystem/v3-ActCode)
+        String code, display;
+        if (t.contains("mottagningsbes")) { code = "AMB"; display = "ambulatory"; }
+        else if (t.contains("hembes"))    { code = "HH";  display = "home health"; }
+        else if (t.contains("distans"))   { code = "VR";  display = "virtual"; }
+        else if (t.contains("akut"))      { code = "EMER"; display = "emergency"; }
+        else if (t.contains("inskrivning") || t.contains("vårdtillfälle") || t.contains("vardtillfalle"))
+                                          { code = "IMP"; display = "inpatient encounter"; }
+        else return null;
+        return new Coding()
+                .setSystem("http://terminology.hl7.org/CodeSystem/v3-ActCode")
+                .setCode(code).setDisplay(display);
     }
 
     /**
@@ -242,7 +275,6 @@ public final class SkeletonMappers {
     public static AuditEvent auditEvent(ListRow row, String patient) {
         AuditEvent a = new AuditEvent();
         a.setId(row.id);
-        // Audit type for "access to a Patient resource" — closest standard code.
         a.setType(new Coding()
                 .setSystem("http://terminology.hl7.org/CodeSystem/audit-event-type")
                 .setCode("rest").setDisplay("RESTful Operation"));
@@ -252,22 +284,38 @@ public final class SkeletonMappers {
         a.setAction(AuditEvent.AuditEventAction.R);
         Date d = bestDate(row);
         if (d != null) a.setRecordedElement(new InstantType(d));
-        a.setOutcome(AuditEvent.AuditEventOutcome._0); // Success
+        a.setOutcome(AuditEvent.AuditEventOutcome._0);
 
-        // Agent: who accessed the journal. data-date timestamp + AccessedBy text.
+        // Agent: who accessed the journal. The .AccessedBy text typically looks like
+        // "Testperson1 e-tjänster (19650713-2758)" — split into name + identifier.
         AuditEvent.AuditEventAgentComponent agent = a.addAgent();
         agent.setRequestor(true);
         if (row.authorName != null) {
-            agent.setName(row.authorName);
-            agent.setWho(new Reference().setDisplay(row.authorName));
+            String[] split = splitAccessedBy(row.authorName);
+            String name = split[0];
+            String pnr  = split[1];
+            agent.setName(name);
+            org.hl7.fhir.r4.model.Reference who = new org.hl7.fhir.r4.model.Reference().setDisplay(name);
+            if (pnr != null) {
+                who.setIdentifier(new org.hl7.fhir.r4.model.Identifier()
+                        .setSystem("urn:oid:1.2.752.129.2.1.3.1")
+                        .setValue(pnr));
+            }
+            agent.setWho(who);
+            // For self-access (the patient logging into their own journal), tag agent.type
+            // as the patient — useful for FHIR clients filtering audits by role.
+            if (pnr != null && patient != null && patient.endsWith("/" + pnr)) {
+                agent.addPolicy("self-access");
+                agent.setType(new CodeableConcept().addCoding(new Coding()
+                        .setSystem("http://terminology.hl7.org/CodeSystem/extra-security-role-type")
+                        .setCode("authserver").setDisplay("Authorization Server")));
+            }
         }
 
-        // Source: the journalen system.
-        a.getSource().setObserver(new Reference().setDisplay("1177 Journalen"));
+        a.getSource().setObserver(new org.hl7.fhir.r4.model.Reference().setDisplay("1177 Journalen"));
 
-        // Entity: the patient's journal. action=R (read) on the patient resource.
         AuditEvent.AuditEventEntityComponent entity = a.addEntity();
-        entity.setWhat(new Reference(patient));
+        entity.setWhat(new org.hl7.fhir.r4.model.Reference(patient));
         entity.getType().setSystem("http://terminology.hl7.org/CodeSystem/audit-entity-type")
                 .setCode("1").setDisplay("Person");
         entity.getRole().setSystem("http://terminology.hl7.org/CodeSystem/object-role")
@@ -275,6 +323,20 @@ public final class SkeletonMappers {
 
         applyNarrative(a, row);
         return a;
+    }
+
+    /**
+     * Splits an AccessedBy text like {@code "Testperson1 e-tjänster (19650713-2758)"}
+     * into {@code [name, personnummer]}. Returns {@code [original, null]} if no match.
+     */
+    static String[] splitAccessedBy(String s) {
+        if (s == null) return new String[]{null, null};
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "^\\s*(.+?)\\s*\\((\\d{6,8}-?\\d{4})\\)\\s*$").matcher(s);
+        if (m.matches()) {
+            return new String[]{ m.group(1).trim(), m.group(2).replace("-", "") };
+        }
+        return new String[]{ s.trim(), null };
     }
 
     /**
