@@ -6,3 +6,7 @@ target/
 *.ipr
 .DS_Store
 *.log
+
+# Claude Code personal files (may hold secrets)
+**/.claude/settings.local.json
+CLAUDE.local.md
